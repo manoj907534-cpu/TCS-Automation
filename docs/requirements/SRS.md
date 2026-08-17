@@ -20,7 +20,7 @@ The initial test-case source is expected to be Excel-compatible structured data.
 
 ## 2. Purpose
 
-The purpose of TCS Automation is to reduce repetitive manual execution of V&V test cases while maintaining traceability, repeatability, objective evidence, and clear PASS/FAIL results.
+The purpose of TCS Automation is to reduce repetitive manual test execution effort while maintaining traceability, repeatability, objective evidence, and clear PASS/FAIL results.
 
 The framework shall be designed so that the test definition remains independent of the technology used by the application under test.
 
@@ -154,35 +154,41 @@ The core framework shall not depend directly on a single UI automation technolog
 
 ### 7.1 Windows Applications
 
-The framework shall support automation of applicable Windows desktop applications through a Windows-specific adapter.
+The framework shall support automation of applicable Windows desktop applications through a Windows-specific adapter. The adapter shall provide a technology-independent interface to the core execution engine for supported UI actions, object identification, state verification, and evidence collection.
 
-The first proof-of-concept target is a Windows application similar to `Smart_Simulator.exe` using the existing TCS format supplied during project planning.
+The Windows adapter shall be designed so that additional Windows UI technologies can be supported without changing the core test command model.
 
 ### 7.2 Qt Widgets Applications
 
 The framework shall provide an adapter architecture capable of interacting with Qt Widgets applications, including common UI concepts such as windows, buttons, text fields, labels, lists, tables, and menus.
 
+The adapter shall translate the common automation model into appropriate Qt-specific operations without exposing Qt implementation details to the TCS author.
+
 ### 7.3 Qt QML / Qt Quick Applications
 
-The framework shall provide a separate adapter capability for Qt QML/Qt Quick applications because QML object models and automation mechanisms differ from traditional Qt Widgets.
+The framework shall provide a separate adapter capability for Qt QML/Qt Quick applications because QML object models, properties, item hierarchies, and available automation mechanisms can differ from traditional Qt Widgets.
 
 The test-case command model shall remain technology-independent.
 
+The detailed QML object discovery, object identification, property access, event triggering, and synchronization mechanisms shall be defined during the architecture and detailed-design phases.
+
 ### 7.4 Embedded Qt / Qt QML Applications
 
-The framework shall support a model in which the primary test engine executes on a development/test PC and communicates with a lightweight target-side Test Agent over an approved communication channel.
+The framework shall support a model in which the primary test engine executes on a development/test PC and communicates with a controlled target-side Test Agent over an approved communication channel.
 
 The embedded architecture shall account for:
 
-- Target hardware limitations.
-- Network connectivity.
+- Target hardware and operating-system constraints.
+- Network connectivity and communication reliability.
 - Qt/Qt QML application access.
-- Display interaction where required.
-- Target application state.
-- Logs and evidence.
+- Display and user-input interaction where required.
+- Application and target state.
+- Logs and evidence collection.
+- Synchronization and timing.
+- Target recovery and test isolation.
 - Safe separation between production and test functionality.
 
-The detailed target communication protocol shall be defined during the architecture phase after target constraints are understood.
+The target-side Test Agent, communication protocol, security/isolation model, deployment method, and exact mechanism for accessing Qt/QML application objects shall be defined only after the target platform constraints and available interfaces are understood.
 
 ---
 
@@ -302,7 +308,7 @@ The next revision cycle shall address:
 8. Evidence and logging requirements.
 9. Reporting requirements.
 10. Requirement/Test/Result traceability.
-11. Embedded target constraints.
+11. Embedded target constraints and target integration model.
 12. Security and test-interface isolation.
 13. Configuration and project management.
 14. Acceptance criteria for each major capability.

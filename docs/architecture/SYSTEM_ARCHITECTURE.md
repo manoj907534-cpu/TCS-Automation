@@ -1,18 +1,18 @@
 # TCS Automation — System Architecture
 
-**Version:** 0.1 — Architecture Draft  
+**Version:** 0.2 — Architecture Draft  
 **Status:** Working Draft  
 **Baseline:** SRS v1.2
 
 ## 1. Purpose
 
-This document defines the high-level architecture for TCS Automation. The architecture is deliberately focused on reducing manual V&V/Test Engineer effort while preserving traceability, repeatability, historical integrity, and engineer control over ambiguous or unsafe automation decisions.
+This document defines the high-level architecture for TCS Automation. The architecture is focused on reducing manual V&V/Test Engineer effort while preserving traceability, repeatability, historical integrity, and engineer control over ambiguous or unsafe automation decisions.
 
 ## 2. Architectural Goals
 
-1. Keep the TCS/ATC model independent of Windows, Qt, or any other automation technology.
+1. Keep the TCS/ATC model independent of Windows, Qt, or other automation technology.
 2. Make adapters replaceable and capability-driven.
-3. Separate test definition, mapping, configuration, execution, results, evidence, and reporting.
+3. Separate test definition, mapping, configuration, execution, results, evidence, audit and reporting.
 4. Never overwrite historical execution attempts.
 5. Make repeated regression execution fast: select project → select configuration → select ATCs → validate → run.
 6. Keep V1 simple: single Windows PC, local database/storage, one active Test Run.
@@ -70,7 +70,7 @@ The UI shall not contain adapter-specific automation logic.
 
 ### 4.2 Project Manager
 
-Owns project identity and project-level configuration, including the configured TCS template definition.
+Owns project identity and project-level configuration, including the configured TCS template definition and template revisions.
 
 Responsibilities:
 - Create/open/archive projects.
@@ -102,13 +102,17 @@ Mapping states:
 
 ### 4.6 Test Configuration Manager
 
-Builds an immutable snapshot for every Test Run containing:
+Maintains editable Test Configurations. When a Test Run is created, the selected configuration is copied into an immutable **Test Run Configuration Snapshot** owned by that Test Run.
+
+The snapshot contains:
 - Application under test and version.
 - Hardware modules/submodules and versions.
 - Software/firmware versions.
 - Target identity.
 - Adapter and adapter revision.
 - Relevant environment/configuration values.
+
+Changes to the editable Test Configuration shall never modify an existing Test Run Snapshot.
 
 ### 4.7 Test Run Manager
 
@@ -117,7 +121,7 @@ Creates and controls named Test Runs/Rounds.
 Responsibilities:
 - Select one adapter.
 - Select ATCs/datasets.
-- Associate Test Configuration.
+- Create and freeze the Test Run Configuration Snapshot.
 - Validate readiness.
 - Start/pause/resume/stop.
 - Handle failure continuation policy.
@@ -147,17 +151,17 @@ It shall not know how a Windows button is clicked or how a Qt object is accessed
 
 The adapter contract provides logical operations such as:
 
-- Launch/attach/connect.
-- Click/double-click/right-click.
-- Type/clear/key press.
-- Select/check/uncheck.
-- Scroll/drag/drop.
-- Wait/wait-for-object/wait-for-state.
-- Verify existence/visibility/text/value/state.
-- Capture evidence.
-- Connection/health check.
+- `ApplicationLaunch`, `ApplicationAttach`, `Connect`.
+- `Click`, `DoubleClick`, `RightClick`.
+- `Type`, `Clear`, `KeyPress`.
+- `Select`, `Check`, `Uncheck`.
+- `Scroll`, `DragDrop`.
+- `WaitForObject`, `WaitForState`, `WaitForText`.
+- `VerifyExists`, `VerifyVisible`, `VerifyText`, `VerifyValue`, `VerifyState`.
+- `CaptureEvidence`.
+- `ConnectionHealthCheck`, `TargetReconnect`.
 
-The adapter shall expose capabilities so unsupported operations are detected before execution.
+These names form the initial canonical capability vocabulary. Parameters and exact implementation contracts will be finalized during detailed design.
 
 ### 4.11 Windows Adapter
 
@@ -206,31 +210,35 @@ Generates PDF and `.xlsx` reports. Reports shall show Test Run configuration and
 
 V1 uses a local database on the Windows Test PC. Repository interfaces shall isolate persistence from domain logic so a future server database can be introduced without changing the domain model.
 
+Persistence of Test Run, Attempt and Result records shall be transactional/atomic: a crash during a write shall not leave a partially recorded execution attempt that appears valid.
+
 ## 5. Key Domain Model
 
 ```text
 Project
  ├── TCS Template
- ├── TCS Revision
- │    └── ATC Revision
+ │    └── Template Revisions
+ ├── TCS Revisions
+ │    └── ATC Revisions
  ├── Object Mappings
  │    └── Mapping Revisions
- ├── Test Configurations
- │    └── Configuration Snapshots
+ ├── Test Configurations (editable)
  └── Test Runs
       ├── Adapter
-      ├── Configuration Snapshot
+      ├── Test Run Configuration Snapshot (immutable copy)
       ├── ATC Selection
       │    └── Dataset Selection
       └── Execution Attempts
            ├── Step Results
-           ├── Dataset Result
+           ├── Dataset Results
            ├── Evidence
            └── Failure/Exception
 
 Audit Log
-Backup Records
+Project Backup Records
 ```
+
+A Test Configuration is editable and reusable. A Test Run owns its own frozen snapshot; the snapshot is not a mutable child shared with the current configuration.
 
 ## 6. Critical Relationships
 
@@ -278,13 +286,14 @@ The summary may show the latest/selected outcome, but all attempts remain availa
 9. System performs pre-run validation
 10. Embedded: Ethernet/target connectivity check
 11. Engineer resolves blocking exceptions
-12. Execution Orchestrator starts
-13. Adapter executes each logical action
-14. Result/Evidence Manager records outcomes
-15. Failure policy determines Continue / Stop / Engineer Action
-16. Test Run completes or is interrupted
-17. Engineer can re-run failed/selected ATCs
-18. Reports and history are available
+12. System freezes Test Configuration Snapshot
+13. Execution Orchestrator starts
+14. Adapter executes each logical action
+15. Result/Evidence Manager records outcomes transactionally
+16. Failure policy determines Continue / Stop / Engineer Action
+17. Test Run completes or is interrupted
+18. Engineer can re-run failed/selected ATCs
+19. Reports and history are available
 ```
 
 ## 8. Failure and Exception Strategy
@@ -298,40 +307,61 @@ The system shall distinguish at least:
 - Configuration failure: required version/configuration is inconsistent or unavailable.
 - Environment failure: required external condition is unavailable.
 
-This distinction prevents communication or automation failures from being incorrectly reported as application FAIL results.
+### Failure-to-result mapping
+
+| Condition | Result State | Rationale |
+|---|---|---|
+| Expected behavior achieved | PASS | Application behavior satisfies expected result. |
+| Application behavior violates expected result | FAIL | Valid test execution produced a negative product result. |
+| Mapping ambiguous/unresolved | BLOCKED | Test could not be safely executed/identified. |
+| Communication unavailable/lost | BLOCKED | Cannot attribute failure to application behavior. |
+| Adapter/automation cannot perform required action | BLOCKED | Execution infrastructure failed before valid verification. |
+| Required configuration/version invalid or unavailable | BLOCKED | Test environment is invalid. |
+| Engineer stops before execution | NOT EXECUTED | No valid execution occurred. |
+| Test intentionally skipped | NOT EXECUTED | Execution was not attempted. |
+
+This distinction prevents communication, mapping, automation and environment problems from being incorrectly reported as application FAIL results.
 
 ## 9. Adapter Capability Model
 
-Each adapter shall expose capabilities such as:
+The following is the initial canonical vocabulary shared by the Adapter API and capability model:
 
 ```text
 ApplicationLaunch
 ApplicationAttach
+Connect
 Click
 DoubleClick
+RightClick
 Type
-Keyboard
+Clear
+KeyPress
 Select
-CheckBox
+Check
+Uncheck
 Scroll
 DragDrop
 WaitForObject
 WaitForState
+WaitForText
+VerifyExists
+VerifyVisible
 VerifyText
 VerifyValue
-Screenshot
-EthernetHealthCheck
+VerifyState
+CaptureEvidence
+ConnectionHealthCheck
 TargetReconnect
 ```
 
-The actual capability list will be finalized during detailed design.
+The actual capability list, parameters and support matrix will be finalized during detailed design.
 
 ## 10. Storage Strategy
 
 V1:
 - Local relational database for structured data.
 - Local evidence directory for screenshots/evidence.
-- Local backup package/destination according to configured backup policy.
+- Project-level backup package/destination according to configured backup policy.
 
 The exact database engine and file layout are architecture implementation decisions.
 
@@ -350,19 +380,27 @@ V1 uses Windows OS identity and local filesystem permissions. Fine-grained appli
 
 The architecture shall avoid storing unnecessary credentials for embedded targets. Target authentication/connection details, if required by a specific adapter, shall be handled through the approved project/environment mechanism.
 
+Backup destinations shall be treated as a separate security boundary: if backups are copied to removable media or a network location, the protection of the Windows Test PC's local ACLs shall not be assumed to protect those copies. The V1 backup design shall therefore document destination permissions/protection before baseline.
+
 ## 13. Backup and Recovery
+
+V1 backup/restore shall be **project-level**. A backup package shall be independently restorable without requiring restoration of unrelated projects on the same Test PC.
 
 Backup scope shall include:
 - Project metadata.
+- TCS template and template revisions.
 - TCS/ATC definitions and revisions.
 - Mappings and mapping revisions.
-- Test Configurations.
+- Editable Test Configurations.
+- Test Run Configuration Snapshots.
 - Test Runs and attempts.
 - Results.
 - Audit records.
 - Evidence.
 
-Restore shall preserve entity relationships and historical execution identity.
+Restore shall preserve entity relationships, stable identifiers and historical execution identity.
+
+Backup and restore operations shall themselves be audited.
 
 ## 14. Technology Decisions — To Be Finalized
 
@@ -385,13 +423,42 @@ The selection shall favor open-source/free components where practical and shall 
 3. No direct database access from UI screens.
 4. Every persistent entity receives a stable identifier.
 5. Historical records are append-oriented/immutable wherever required.
-6. Adapter capabilities are discoverable.
-7. Failures are classified before reporting.
+6. Adapter capabilities are discoverable and use the canonical vocabulary defined in Section 9.
+7. Failures are classified before reporting and mapped to a defined result state.
 8. Manual intervention is explicit and auditable.
 9. New adapters should implement the existing adapter contract rather than alter core execution logic.
-10. V1 simplicity must not prevent future centralized deployment.
+10. Test Run/Attempt/Result persistence shall be atomic/transactional.
+11. A Test Run owns its immutable configuration snapshot; editable Test Configurations shall never mutate historical snapshots.
+12. V1 simplicity must not prevent future centralized deployment.
 
-## 16. Next Design Artifacts
+## 16. SRS Traceability
+
+The following table provides high-level architecture coverage. Detailed verification traceability will be maintained during design/test planning.
+
+| Architecture Area | Primary SRS Coverage |
+|---|---|
+| Presentation/UI | FR-001–003, FR-021, FR-050–054, FR-080–084, FR-100–106, FR-150–153 |
+| Project Manager | FR-001–003, FR-013, FR-160–162 |
+| TCS Import & Validation | FR-010–015 |
+| ATC Manager | FR-020–026 |
+| Mapping Manager | FR-040–048 |
+| Test Configuration Manager | FR-070–074 |
+| Test Run Manager | FR-050–054, FR-080–084, FR-100–106 |
+| Validation Engine | FR-090–095 |
+| Execution Orchestrator | FR-030–032, FR-100–106, FR-110–112 |
+| Adapter API | FR-030–032, FR-050–054 |
+| Windows Adapter | FR-060–063 |
+| Embedded Qt Adapter | FR-064–065, FR-130–133 |
+| Result/History Manager | FR-100–112 |
+| Evidence Manager | FR-120–125 |
+| Audit Manager | FR-140–142 |
+| Report Manager | FR-150–153 |
+| Data Layer | FR-160–162, NFR-002, NFR-007, NFR-011–014 |
+| Security Boundary | NFR-009–010 |
+| Backup/Recovery | FR-160–162, NFR-012 |
+| Cross-cutting architecture | NFR-001–008, NFR-013–015 |
+
+## 17. Next Design Artifacts
 
 The next architecture/design work shall define, in order:
 
@@ -412,4 +479,4 @@ The next architecture/design work shall define, in order:
 
 ---
 
-**Status:** Architecture Draft — not yet baselined.
+**Status:** Architecture Draft v0.2 — ready for focused review before detailed domain/database design.

@@ -1,8 +1,17 @@
 # TCS Automation — Domain Model & Database Schema
 
-**Version:** 0.1 — Design Draft  
-**Status:** Working Draft  
+**Version:** 0.2 — Design Draft
+**Status:** Working Draft
 **Baseline:** Architecture v0.2 / SRS v1.2
+
+**Changelog since v0.1:**
+- Split `Hardware Module` into a generic `Module` entity with an explicit `module_type` (`HARDWARE` / `FIRMWARE` / `SOFTWARE`) so software/firmware-only components have a proper home (previously `Module Version` claimed hardware/software/firmware coverage while its parent entity was scoped to hardware only).
+- Clarified `Execution Attempt` linkage for ATCs with zero datasets — a default dataset row is created at Test Run preparation time so the attempt FK always resolves.
+- Replaced the ambiguous `Failure.attempt_id or step_result_id` phrasing with two explicit nullable FK columns and a check constraint.
+- Corrected the Result State diagram so `BLOCKED` branches directly from `EXECUTING`, parallel to `PASS`/`FAIL`, instead of appearing nested under `FAIL`.
+- Added `Execution Attempt.status` enum values.
+- Added `Mapping Revision.application_version_id` (optional) to support diagnosing recovery failures across app versions.
+- Flagged dataset credential handling as an explicit open item (Sec 17).
 
 ## 1. Purpose
 
@@ -31,22 +40,23 @@ The primary goals are:
 8. Version records are reusable but the exact versions used by a run are frozen in its snapshot.
 9. Database writes for Test Run/Attempt/Result state are transactional.
 10. Deleting business data is not the normal mechanism for correcting history; corrections create new revisions.
+11. Every ATC has an execution linkage path even when it defines no datasets (see 4.20).
 
 ## 3. Conceptual Domain Model
 
-```text
+```
 PROJECT
   │
   ├── TCS TEMPLATE
   │     └── TEMPLATE REVISION
   │            └── TCS REVISION
   │                   └── ATC REVISION
-  │                          └── DATASET
+  │                          └── DATASET (zero, one, or many)
   │
   ├── APPLICATION
   │     └── APPLICATION VERSION
   │
-  ├── HARDWARE MODULE
+  ├── MODULE (hardware / firmware / software)
   │     └── MODULE VERSION
   │
   ├── TARGET
@@ -64,7 +74,7 @@ PROJECT
          │      └── TARGET/ENVIRONMENT SNAPSHOT
          │
          ├── TEST RUN ATC
-         │      └── DATASET SELECTION
+         │      └── DATASET SELECTION (default row if ATC has no datasets)
          │
          └── EXECUTION ATTEMPT
                 └── STEP RESULT
@@ -82,6 +92,7 @@ BACKUP RECORD
 Represents an independent testing project.
 
 Key fields:
+
 - `project_id`
 - `project_code`
 - `name`
@@ -98,6 +109,7 @@ A project is the primary ownership boundary for TCS, ATCs, mappings, configurati
 Defines the expected `.xlsx` structure for a project.
 
 Key fields:
+
 - `template_id`
 - `project_id`
 - `name`
@@ -109,6 +121,7 @@ Key fields:
 Immutable revision of a template definition.
 
 Key fields:
+
 - `template_revision_id`
 - `template_id`
 - `revision_number`
@@ -122,6 +135,7 @@ Key fields:
 Represents one imported/normalized version of a TCS.
 
 Key fields:
+
 - `tcs_revision_id`
 - `project_id`
 - `template_revision_id`
@@ -139,6 +153,7 @@ The source workbook is not silently overwritten. A corrected workbook creates a 
 A versioned, technology-independent test case generated from or associated with a TCS revision.
 
 Key fields:
+
 - `atc_revision_id`
 - `tcs_revision_id`
 - `atc_key`
@@ -156,6 +171,7 @@ Key fields:
 Represents a parameter/data set associated with an ATC revision.
 
 Key fields:
+
 - `dataset_id`
 - `atc_revision_id`
 - `dataset_key`
@@ -164,13 +180,16 @@ Key fields:
 - `revision_number`
 - `status`
 
-One ATC may have zero, one or many datasets.
+One ATC may have zero, one or many datasets. See 4.20 for how ATCs with zero datasets are executed.
+
+> **Open item:** `parameters` may contain credential-like values (e.g., a login test's password). See Sec 17 #11 for the deferred decision on masking/encrypting these at rest and in exported reports.
 
 ### 4.7 Application
 
 Represents the application under test, such as `SM1.exe`.
 
 Key fields:
+
 - `application_id`
 - `project_id`
 - `name`
@@ -182,6 +201,7 @@ Key fields:
 Reusable application version record.
 
 Key fields:
+
 - `application_version_id`
 - `application_id`
 - `version`
@@ -189,31 +209,33 @@ Key fields:
 - `artifact_hash` (optional)
 - `notes`
 
-### 4.9 Hardware Module
+### 4.9 Module
 
-Represents a hardware module/submodule required by the system under test.
+Represents a hardware, firmware, or software module/submodule required by the system under test. Replaces the earlier "Hardware Module" entity so firmware- and software-only components (not tied to a physical card) have a proper home, consistent with SRS Sec 11 / FR-072.
 
 Examples:
-- Card-1
-- Card-2
-- Card-3
-- Card-4
+
+- Card-1, Card-2, Card-3, Card-4 (`module_type = HARDWARE`)
+- Bootloader (`module_type = FIRMWARE`)
+- Diagnostics service (`module_type = SOFTWARE`)
 
 Key fields:
+
 - `module_id`
 - `project_id`
 - `parent_module_id` (nullable for top-level module)
 - `name`
 - `module_code`
-- `module_type`
+- `module_type` (`HARDWARE` | `FIRMWARE` | `SOFTWARE`)
 
-This supports the user's requirement that a Main Module can contain hardware/software submodules.
+This supports the requirement that a Main Module can contain hardware/software/firmware submodules.
 
 ### 4.10 Module Version
 
-Reusable version record for a hardware/software/firmware module.
+Reusable version record for a module (hardware, firmware, or software).
 
 Key fields:
+
 - `module_version_id`
 - `module_id`
 - `version`
@@ -226,6 +248,7 @@ Key fields:
 Represents the test target/board/device.
 
 Key fields:
+
 - `target_id`
 - `project_id`
 - `name`
@@ -241,6 +264,7 @@ Credentials/secrets are not stored in this general entity.
 Logical mapping definition connecting an ATC target reference to an adapter-visible target object.
 
 Key fields:
+
 - `mapping_id`
 - `project_id`
 - `atc_key`
@@ -253,17 +277,20 @@ Key fields:
 Immutable mapping version.
 
 Key fields:
+
 - `mapping_revision_id`
 - `mapping_id`
 - `revision_number`
 - `target_locator`
 - `identification_method`
 - `confidence_state`
+- `application_version_id` (optional — the application version this mapping was validated against, to help diagnose recovery failures when multiple app versions are in play)
 - `validation_notes`
 - `validated_by`
 - `validated_at`
 
 Possible confidence states:
+
 - `STRONG`
 - `CANDIDATE`
 - `UNRESOLVED`
@@ -274,6 +301,7 @@ Possible confidence states:
 Editable reusable environment definition.
 
 Key fields:
+
 - `test_configuration_id`
 - `project_id`
 - `name`
@@ -291,6 +319,7 @@ Associated module versions are stored through `test_configuration_modules`.
 Associates a Test Configuration with the exact selected reusable module versions.
 
 Fields:
+
 - `test_configuration_id`
 - `module_id`
 - `module_version_id`
@@ -301,6 +330,7 @@ Fields:
 Represents one named execution round/build verification session.
 
 Key fields:
+
 - `test_run_id`
 - `project_id`
 - `run_name`
@@ -317,6 +347,7 @@ Key fields:
 Immutable copy created when the Test Run is prepared/frozen.
 
 Key fields:
+
 - `snapshot_id`
 - `test_run_id`
 - `source_test_configuration_id`
@@ -335,6 +366,7 @@ The snapshot must be self-contained enough to identify the environment used even
 Frozen module/version combination belonging to a Test Run snapshot.
 
 Fields:
+
 - `snapshot_id`
 - `module_id`
 - `module_name`
@@ -346,6 +378,7 @@ Fields:
 Associates a selected ATC revision with a Test Run.
 
 Fields:
+
 - `test_run_atc_id`
 - `test_run_id`
 - `atc_revision_id`
@@ -357,11 +390,15 @@ Fields:
 Associates a selected dataset with the Test Run ATC.
 
 Fields:
+
 - `test_run_dataset_id`
 - `test_run_atc_id`
-- `dataset_id`
+- `dataset_id` (nullable — see below)
+- `is_default_placeholder` (boolean)
 - `sequence_no`
 - `selection_status`
+
+**Zero-dataset ATCs:** if an ATC Revision defines no datasets, Test Run preparation creates exactly one `Test Run Dataset` row with `dataset_id = NULL` and `is_default_placeholder = true`. This guarantees every `Execution Attempt` always resolves through a `Test Run Dataset`, without requiring a second, optional FK path on `Execution Attempt`.
 
 The selected dataset definition should be snapshotted or content-hashed so later dataset edits cannot alter historical meaning.
 
@@ -370,6 +407,7 @@ The selected dataset definition should be snapshotted or content-hashed so later
 One actual execution attempt of a selected Test Run ATC/dataset.
 
 Fields:
+
 - `attempt_id`
 - `test_run_dataset_id`
 - `attempt_number`
@@ -380,13 +418,25 @@ Fields:
 - `execution_mode`
 - `failure_summary`
 
+`status` values:
+
+- `NOT_EXECUTED`
+- `EXECUTING`
+- `PASS`
+- `FAIL`
+- `BLOCKED`
+- `INTERRUPTED`
+
 Each retry creates a new attempt.
+
+**Interruption rule:** if a Test Run transitions to `INTERRUPTED` or `STOPPED` (Sec 9) while an attempt is `EXECUTING`, that attempt's `status` is set to `INTERRUPTED` (not silently left as `EXECUTING` and not auto-converted to `FAIL`). An `INTERRUPTED` attempt requires an explicit resume/re-run/new-run decision, per SRS FR-065.
 
 ### 4.22 Step Result
 
 Result of one logical ATC step during one execution attempt.
 
 Fields:
+
 - `step_result_id`
 - `attempt_id`
 - `step_sequence`
@@ -401,6 +451,7 @@ Fields:
 - `error_message`
 
 Result states:
+
 - `PASS`
 - `FAIL`
 - `BLOCKED`
@@ -411,8 +462,10 @@ Result states:
 Structured record explaining why execution could not continue or produced a failure.
 
 Fields:
+
 - `failure_id`
-- `attempt_id` or `step_result_id`
+- `attempt_id` (nullable)
+- `step_result_id` (nullable)
 - `category`
 - `code`
 - `message`
@@ -420,7 +473,10 @@ Fields:
 - `resolved`
 - `resolution_notes`
 
+**Constraint:** exactly one of `attempt_id` / `step_result_id` must be set — `attempt_id` for attempt-level failures (e.g., communication loss before any step ran), `step_result_id` for step-level failures. Enforced with a database check constraint, not left as an implicit "or".
+
 Categories:
+
 - `TEST_FAILURE`
 - `AUTOMATION_FAILURE`
 - `MAPPING_EXCEPTION`
@@ -433,6 +489,7 @@ Categories:
 Evidence associated with an execution event.
 
 Fields:
+
 - `evidence_id`
 - `project_id`
 - `test_run_id`
@@ -451,6 +508,7 @@ V1 primarily supports screenshots/attachments; video is out of scope.
 Immutable audit record.
 
 Fields:
+
 - `audit_event_id`
 - `project_id`
 - `user_identity`
@@ -467,6 +525,7 @@ Fields:
 Records project-level backup/restore operations.
 
 Fields:
+
 - `backup_id`
 - `project_id`
 - `backup_type`
@@ -479,7 +538,7 @@ Fields:
 
 ## 5. Proposed Relational Tables
 
-```text
+```
 projects
 project_users                         (future multi-user ready; V1 may contain only owner)
 
@@ -491,7 +550,7 @@ atc_datasets
 
 applications
 application_versions
-hardware_modules
+modules
 module_versions
 
 targets
@@ -526,21 +585,21 @@ Every project-owned entity must ultimately reference a project either directly o
 
 ### TCS/ATC lineage
 
-```text
+```
 Template Revision
       ↓
 TCS Revision
       ↓
 ATC Revision
       ↓
-Dataset
+Dataset (optional)
 ```
 
-An execution record references the exact ATC revision/dataset selected for that Test Run.
+An execution record references the exact ATC revision/dataset (or default placeholder) selected for that Test Run.
 
 ### Configuration lineage
 
-```text
+```
 Editable Test Configuration
           ↓
     Run preparation
@@ -552,12 +611,12 @@ Immutable Test Run Snapshot
 
 ### Execution lineage
 
-```text
+```
 Test Run
   ↓
 Test Run ATC
   ↓
-Test Run Dataset
+Test Run Dataset (real or default placeholder)
   ↓
 Execution Attempt
   ↓
@@ -567,8 +626,7 @@ Evidence / Failure
 ```
 
 This makes it possible to answer:
-
-> Which application version, hardware module versions, ATC revision, dataset, mapping and execution attempt produced this result?
+> Which application version, module versions, ATC revision, dataset, mapping and execution attempt produced this result?
 
 ## 7. Historical Integrity Rules
 
@@ -586,7 +644,7 @@ Existing Test Runs continue to point to the old revision.
 
 Changing:
 
-```text
+```
 SM1.exe v2.4.1 → v2.4.2
 Card-2 v3.04 → v3.05
 ```
@@ -595,7 +653,7 @@ must not alter any existing Test Run Snapshot.
 
 ### Rule 4 — Re-run means new attempt
 
-```text
+```
 ATC-100 / Dataset-01
   Attempt 1 → FAIL
   Attempt 2 → PASS
@@ -607,35 +665,44 @@ Both attempts remain stored.
 
 Evidence files should be content-hashed. Replacing a file at the same logical evidence location is not permitted.
 
+### Rule 6 — Interruption is preserved, not overwritten
+
+An attempt interrupted mid-execution is marked `INTERRUPTED`, never silently marked `PASS`, `FAIL`, or left ambiguous as `EXECUTING`.
+
 ## 8. Result State Model
 
-```text
-                    ┌───────────────┐
-                    │ NOT_EXECUTED  │
-                    └───────┬───────┘
-                            │ execute
-                            ▼
-                     ┌────────────┐
-                     │ EXECUTING  │
-                     └─────┬──────┘
-                           / \
-                          /   \
-                         ▼     ▼
-                      PASS     FAIL
-                         \
-                          \
-                           BLOCKED
+```
+              ┌───────────────┐
+              │ NOT_EXECUTED  │
+              └───────┬───────┘
+                      │ execute
+                      ▼
+               ┌────────────┐
+               │ EXECUTING  │
+               └──────┬─────┘
+           ┌───────────┼────────────┐
+           │            │            │
+           ▼            ▼            ▼
+        PASS          FAIL       BLOCKED
+                                     │
+                          (mapping / communication /
+                           configuration / automation /
+                           environment conditions)
+
+      EXECUTING ──(run interrupted)──▶ INTERRUPTED
 ```
 
-`BLOCKED` is used when valid verification could not be performed because of mapping, communication, configuration, automation or environment conditions.
+`BLOCKED` is a distinct outcome from `FAIL`, used when valid verification could not be performed because of mapping, communication, configuration, automation or environment conditions — it is **not** a sub-case of `FAIL`.
 
-`NOT_EXECUTED` is used for selected tests that were skipped/stopped before valid execution.
+`NOT_EXECUTED` is used for selected tests that were skipped/stopped before execution began.
+
+`INTERRUPTED` is used when a step or attempt was actively executing when its Test Run was interrupted or stopped; it requires an explicit resume/re-run decision (see 4.21).
 
 ## 9. Test Run State Model
 
 Proposed states:
 
-```text
+```
 DRAFT
   ↓
 READY_FOR_VALIDATION
@@ -651,7 +718,7 @@ RUNNING ──→ PAUSED ──→ RUNNING   │
   └──→ INTERRUPTED ───────────────┘
 ```
 
-An interrupted run is not silently converted into a completed result. The system must preserve the interruption and allow an explicit resume/new run/re-run decision.
+An interrupted run is not silently converted into a completed result. The system must preserve the interruption and allow an explicit resume/new run/re-run decision. Per Sec 4.21/8, any attempt that was `EXECUTING` when the Test Run entered `STOPPED`/`INTERRUPTED` is itself marked `INTERRUPTED`.
 
 ## 10. Dataset Model
 
@@ -659,7 +726,7 @@ V1 supports parameterized execution.
 
 Example:
 
-```text
+```
 ATC-020: Verify login
 
 Dataset-01
@@ -675,20 +742,20 @@ Dataset-03
  password = ****
 ```
 
-Each selected dataset gets its own execution result and can be re-run independently.
+Each selected dataset gets its own execution result and can be re-run independently. An ATC with no datasets defined (e.g., a simple non-parameterized check) executes through a single default `Test Run Dataset` placeholder row (Sec 4.20) rather than requiring a separate execution path.
 
 ## 11. Mapping and Future TCS Corrections
 
 The architecture intentionally separates:
 
-```text
+```
 TCS/ATC definition
         │
         ▼
 Logical target reference
         │
         ▼
-Mapping revision
+Mapping revision (optionally tagged with the app version it was validated against)
         │
         ▼
 Adapter-specific target locator
@@ -700,23 +767,23 @@ A mapping correction creates a new mapping revision. Future runs use the new rev
 
 ## 12. Version Tracking Example
 
-For the user's representative case:
+For the representative case:
 
-```text
+```
 Project: SM1 Verification
 
 Application:
   SM1.exe
   Version: 2.4.1
 
-Main Hardware Module:
-  Controller
+Main Module: Controller (HARDWARE)
 
 Submodules:
-  Card-1 → 1.10
-  Card-2 → 3.04
-  Card-3 → 2.15
-  Card-4 → 5.01
+  Card-1 → 1.10 (HARDWARE)
+  Card-2 → 3.04 (HARDWARE)
+  Card-3 → 2.15 (HARDWARE)
+  Card-4 → 5.01 (HARDWARE)
+  Bootloader → 1.02 (FIRMWARE)
 
 Test Configuration:
   SM1-Config-001
@@ -730,6 +797,7 @@ Snapshot:
   Card-2 = 3.04
   Card-3 = 2.15
   Card-4 = 5.01
+  Bootloader = 1.02
 
 ATCs:
   ATC-001
@@ -750,7 +818,7 @@ V1 backup is project-level.
 
 A project backup package should contain:
 
-```text
+```
 manifest
 project metadata
 templates + revisions
@@ -769,7 +837,7 @@ audit events
 
 Restore must validate the package before modifying the local database. The recommended restore process is:
 
-```text
+```
 Select backup
     ↓
 Validate manifest/hash
@@ -815,6 +883,7 @@ Physical deletion should be restricted to controlled maintenance operations and 
 V1 is single-user/single-PC. The database is therefore not designed for simultaneous active Test Runs by multiple users.
 
 The schema nevertheless avoids assumptions that would prevent future multi-user deployment:
+
 - Stable IDs.
 - User identity fields.
 - Explicit ownership relationships.
@@ -837,25 +906,27 @@ These are intentionally deferred to detailed design:
 8. Exact restore conflict strategy.
 9. Retention/cleanup implementation.
 10. Database migration/versioning mechanism.
+11. Whether credential-like Dataset parameter values (Sec 4.6) should be masked or encrypted at rest and in exported reports.
 
 ## 18. Acceptance Questions for Review
 
 Before this schema is baselined, reviewers should verify:
 
 1. Can we identify the exact TCS revision used by a Test Run?
-2. Can we identify the exact ATC revision and dataset used?
+2. Can we identify the exact ATC revision and dataset (or default placeholder) used?
 3. Can we identify the exact application version?
-4. Can we identify every hardware/software module and submodule version used?
-5. Can we identify the mapping revision used?
-6. Can we distinguish application FAIL from infrastructure BLOCKED?
+4. Can we identify every module (hardware/firmware/software) and submodule version used?
+5. Can we identify the mapping revision used, and which application version it was validated against?
+6. Can we distinguish application FAIL from infrastructure BLOCKED, and from an INTERRUPTED attempt?
 7. Can an ATC be re-run without overwriting the previous attempt?
 8. Can one dataset be re-run without changing another dataset's result?
 9. Can a corrected TCS/ATC/mapping be introduced without modifying historical runs?
 10. Can a project be backed up and restored independently?
 11. Can a reviewer understand a run from its exported report and evidence?
 12. Can the model evolve to centralized multi-user operation later?
+13. Can an ATC with zero datasets still be executed and traced with the same rigor as a parameterized one?
 
 ---
 
-**Status:** Domain Model & Database Schema Draft v0.1 — ready for review.  
+**Status:** Domain Model & Database Schema Draft v0.2 — ready for review.
 **Next artifact after review:** Detailed SQL schema + Test Run state machine + Adapter interface contract.

@@ -1,7 +1,7 @@
 # TCS Automation — Test Run State Machine (Detailed)
 
-**Version:** 0.4 — Design Draft
-**Status:** Working Draft — candidate baseline for Domain Model v0.3 / SQL DDL
+**Version:** 0.4 — Approved Baseline
+**Status:** Behavioral design frozen. Not yet labeled Final v1.0 — will only be reopened if Domain Model v0.3 or the SQL DDL exposes a genuine contradiction, not for further stylistic refinement.
 **Baseline:** SRS v1.2 / Architecture v0.2 / Domain Model & Database Schema v0.2
 
 **Changelog since v0.3:**
@@ -294,8 +294,9 @@ Test Run Round-07 final:
 - **I-08 — One active Test Run per Test PC.** Per SRS NFR-013.
 - **I-09 — Snapshot immutability.** After `READY → RUNNING`, the execution snapshot cannot change for the life of that Test Run.
 - **I-10 — Attempt aggregation algorithm.** An Attempt's terminal state is determined as follows:
-  - **If the Attempt entered `EXECUTING`** (has at least one Step Result), its terminal state is derived from its steps in this priority order: `INTERRUPTED` if any step is `INTERRUPTED`; else `STOPPED` if any step is `STOPPED`; else `FAIL` if any step is `FAIL`; else `BLOCKED` if any step is `BLOCKED`; else `PASS` if every executed step is `PASS`.
-  - **If the Attempt never entered `EXECUTING`** (zero Step Results), its only valid terminal state is `BLOCKED` via the pre-execution mapping-resolution gate (Sec 5.2), with `failure_category = MAPPING_EXCEPTION`. An Attempt with zero executed steps can **never** aggregate to `PASS` — there is no code path that produces this, and no implementation should introduce one.
+  - **If the Attempt entered `EXECUTING`**, its terminal state is derived from its Step Results according to the following priority order: `INTERRUPTED` if any step is `INTERRUPTED`; else `STOPPED` if any step is `STOPPED`; else `FAIL` if any step is `FAIL`; else `BLOCKED` if any step is `BLOCKED`; else `PASS` if every executed step is `PASS`.
+  - **If the Attempt never entered `EXECUTING`**, its only valid terminal state is pre-execution `BLOCKED` through the mapping-resolution gate (Sec 5.2), with `failure_category = MAPPING_EXCEPTION`. An Attempt with zero executed steps can **never** aggregate to `PASS` — there is no code path that produces this, and no implementation should introduce one.
+  - These two cases are distinguished by whether the Attempt ever entered `EXECUTING` at all, not by whether it "has at least one completed Step Result" — an Attempt that entered `EXECUTING` and was then immediately `STOPPED`/`INTERRUPTED` before any step reached a terminal state still falls under the first case, derived from Sec 5.1's terminal-cascade rule.
 - **I-11 — No orphan execution state.** An `EXECUTING` Attempt must belong to a `RUNNING` Test Run. An in-progress Step Result must belong to an `EXECUTING` Attempt.
 - **I-12 — Pause consistency.** A `PAUSED` Test Run must have zero Attempts in `EXECUTING`. Consequently, a transition out of `PAUSED` (to `RUNNING`, `STOPPED`, or `INTERRUPTED`) never touches any Attempt's execution state directly — see the `PAUSED → INTERRUPTED` row in Sec 3.1.
 
@@ -329,5 +330,5 @@ This is required even in the single-user, single-PC V1 scope, because the UI thr
 
 ---
 
-**Status:** Test Run State Machine Draft v0.4 — candidate baseline.
-**Next artifact after review:** Domain Model v0.3 (add `parent_test_run_id`, validation history table, Test Run `outcome` field, run-scoped mapping resolution record), then Detailed SQL schema (DDL), then Adapter interface contract.
+**Status:** Test Run State Machine v0.4 — Approved Baseline / Candidate Final. Behavioral decisions are frozen.
+**Next artifact:** Domain Model v0.3 (add `parent_test_run_id`, validation history table, Test Run `outcome` field, run-scoped mapping resolution record), then Detailed SQL schema (DDL), then Adapter interface contract.

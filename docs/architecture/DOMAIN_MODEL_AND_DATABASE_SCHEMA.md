@@ -1,17 +1,27 @@
 # TCS Automation — Domain Model & Database Schema
 
-**Version:** 0.2 — Design Draft
+**Version:** 0.3 — Design Draft
 **Status:** Working Draft
-**Baseline:** Architecture v0.2 / SRS v1.2
+**Baseline:** Architecture v0.2 / SRS v1.2 / Test Run State Machine v0.4
 
-**Changelog since v0.1:**
+> **Note on versioning:** this file combines two rounds of changes in one commit. The previously committed file on GitHub was still v0.1 — the intended v0.2 update did not land. This version (0.3) includes both the v0.2 fixes and the new v0.3 additions driven by the State Machine v0.4 baseline, so the repo goes straight from v0.1 to v0.3 in one step.
+
+**Changes since v0.1 (the "v0.2" fixes that should have landed earlier):**
 - Split `Hardware Module` into a generic `Module` entity with an explicit `module_type` (`HARDWARE` / `FIRMWARE` / `SOFTWARE`) so software/firmware-only components have a proper home (previously `Module Version` claimed hardware/software/firmware coverage while its parent entity was scoped to hardware only).
 - Clarified `Execution Attempt` linkage for ATCs with zero datasets — a default dataset row is created at Test Run preparation time so the attempt FK always resolves.
 - Replaced the ambiguous `Failure.attempt_id or step_result_id` phrasing with two explicit nullable FK columns and a check constraint.
 - Corrected the Result State diagram so `BLOCKED` branches directly from `EXECUTING`, parallel to `PASS`/`FAIL`, instead of appearing nested under `FAIL`.
 - Added `Execution Attempt.status` enum values.
 - Added `Mapping Revision.application_version_id` (optional) to support diagnosing recovery failures across app versions.
-- Flagged dataset credential handling as an explicit open item (Sec 17).
+- Flagged dataset credential handling as an explicit open item.
+
+**Changes since v0.1 (new "v0.3" additions, driven by Test Run State Machine v0.4):**
+- Added `Test Run.parent_test_run_id` — a generic run-to-run lineage link (interruption recovery, re-execution of a completed run, etc.), per State Machine Sec 8/13.
+- Added `Test Run.outcome` — a separate field from `status`, storing the computed Outcome (`PASS`/`FAIL`/`BLOCKED`/`PARTIAL`/`NOT_EVALUATED`) per State Machine Sec 4. Computed once, at the moment the Test Run reaches a terminal state; never recalculated.
+- Added `test_run_validations` — a validation-history table recording every validation cycle a Test Run goes through, not just the latest, per State Machine Sec 7.
+- Added `test_run_mapping_resolutions` — a run-scoped record of `CANDIDATE` mapping confirmations, so confirming a mapping during one run does not silently modify the canonical `Mapping Revision` for all future runs, per State Machine Sec 5.2.
+- Updated `Execution Attempt.status` to include `STOPPED` (distinct from `INTERRUPTED`) per State Machine v0.3+, and to allow `started_at = NULL` for the pre-execution `BLOCKED` case per State Machine I-03/I-10.
+- Updated the Result State Model (Sec 8) and Test Run State Model (Sec 9) to match State Machine v0.4 exactly, replacing the earlier, looser sketches.
 
 ## 1. Purpose
 
@@ -22,11 +32,12 @@ The primary goals are:
 - Preserve complete Test Run traceability.
 - Keep historical records immutable where required.
 - Support TCS → ATC → Dataset → Execution relationships.
-- Support application and hardware/software version combinations.
+- Support application and hardware/software/firmware version combinations.
 - Support mapping revisions and future TCS corrections without corrupting previous runs.
 - Support repeat execution without overwriting previous attempts.
 - Support project-level backup and restore.
 - Keep the model suitable for future centralized/multi-user deployment.
+- Faithfully implement the state and outcome rules defined in the Test Run State Machine v0.4.
 
 ## 2. Design Principles
 
@@ -38,9 +49,11 @@ The primary goals are:
 6. Dataset results are independently traceable.
 7. Mapping revisions are preserved.
 8. Version records are reusable but the exact versions used by a run are frozen in its snapshot.
-9. Database writes for Test Run/Attempt/Result state are transactional.
+9. Database writes for Test Run/Attempt/Result state are transactional and atomic (State Machine Sec 12).
 10. Deleting business data is not the normal mechanism for correcting history; corrections create new revisions.
 11. Every ATC has an execution linkage path even when it defines no datasets (see 4.20).
+12. Lifecycle **state** and result **outcome** are stored separately, never conflated (State Machine Sec 4).
+13. An engineer's in-run judgment call (e.g., confirming a `CANDIDATE` mapping) does not silently mutate a canonical, reusable record.
 
 ## 3. Conceptual Domain Model
 
@@ -66,7 +79,9 @@ PROJECT
   │
   ├── TEST CONFIGURATION
   │
-  └── TEST RUN
+  └── TEST RUN  (parent_test_run_id → another TEST RUN, optional)
+         │
+         ├── TEST RUN VALIDATION (one or many, per validation cycle)
          │
          ├── TEST RUN CONFIGURATION SNAPSHOT
          │      ├── APPLICATION VERSION SNAPSHOT
@@ -75,6 +90,8 @@ PROJECT
          │
          ├── TEST RUN ATC
          │      └── DATASET SELECTION (default row if ATC has no datasets)
+         │
+         ├── TEST RUN MAPPING RESOLUTION (run-scoped CANDIDATE confirmations)
          │
          └── EXECUTION ATTEMPT
                 └── STEP RESULT
@@ -211,7 +228,7 @@ Key fields:
 
 ### 4.9 Module
 
-Represents a hardware, firmware, or software module/submodule required by the system under test. Replaces the earlier "Hardware Module" entity so firmware- and software-only components (not tied to a physical card) have a proper home, consistent with SRS Sec 11 / FR-072.
+Represents a hardware, firmware, or software module/submodule required by the system under test. Replaces the earlier "Hardware Module" entity so firmware- and software-only components (not tied to a physical card) have a proper home.
 
 Examples:
 
@@ -296,6 +313,8 @@ Possible confidence states:
 - `UNRESOLVED`
 - `MANUAL_CONFIRMED`
 
+**Important:** a `CANDIDATE` mapping being confirmed by an engineer *during a Test Run* does **not** change this record's `confidence_state` to `MANUAL_CONFIRMED`. That in-run confirmation is captured separately — see 4.20a `Test Run Mapping Resolution`. Only a distinct, explicit mapping-management workflow (outside a Test Run) creates a new `Mapping Revision` with `confidence_state = MANUAL_CONFIRMED`.
+
 ### 4.14 Test Configuration
 
 Editable reusable environment definition.
@@ -333,14 +352,36 @@ Key fields:
 
 - `test_run_id`
 - `project_id`
+- `parent_test_run_id` (nullable, self-referencing FK — links a recovery/re-execution run back to the run it followed; not restricted to interruption recovery, State Machine Sec 8)
 - `run_name`
 - `run_number`
-- `status`
+- `status` (lifecycle state — see Sec 9)
+- `outcome` (nullable until terminal — computed result rollup, see Sec 8a)
 - `created_by`
 - `started_at`
 - `completed_at`
+- `pause_requested_at` (nullable)
+- `pause_effective_at` (nullable)
 - `adapter_type`
 - `created_at`
+
+`status` values: `DRAFT`, `READY_FOR_VALIDATION`, `VALIDATION_FAILED`, `READY`, `RUNNING`, `PAUSED`, `COMPLETED`, `STOPPED`, `INTERRUPTED`.
+
+`outcome` values: `PASS`, `FAIL`, `BLOCKED`, `PARTIAL`, `NOT_EVALUATED`. Set once, at the moment `status` reaches a terminal value (`COMPLETED`/`STOPPED`/`INTERRUPTED`), per the algorithm in State Machine Sec 4. Never recalculated afterward.
+
+### 4.16a Test Run Validation
+
+Records one validation cycle for a Test Run. A Test Run may have many, since validation is repeatable (State Machine Sec 7).
+
+Fields:
+
+- `validation_id`
+- `test_run_id`
+- `validated_at`
+- `validator_version`
+- `result` (`PASSED` | `FAILED`)
+- `findings` (structured list of blocking/non-blocking items)
+- `superseded` (boolean — set true when a later edit invalidates this cycle per the `READY → DRAFT` staleness rule, State Machine Sec 3.3)
 
 ### 4.17 Test Run Configuration Snapshot
 
@@ -402,6 +443,23 @@ Fields:
 
 The selected dataset definition should be snapshotted or content-hashed so later dataset edits cannot alter historical meaning.
 
+### 4.20a Test Run Mapping Resolution
+
+Records an in-run mapping confirmation decision, scoped to one Test Run — implements the rule in 4.13 that confirming a `CANDIDATE` mapping during a run does not mutate the canonical `Mapping Revision`.
+
+Fields:
+
+- `resolution_id`
+- `test_run_id`
+- `mapping_id`
+- `mapping_revision_id` (the `CANDIDATE` revision being resolved)
+- `resolved_confidence` (`MANUAL_CONFIRMED` | `REJECTED`)
+- `resolved_by`
+- `resolved_at`
+- `resolution_reason` (optional free text)
+
+A future Test Run against the same `Mapping Revision` still sees `confidence_state = CANDIDATE` and requires its own confirmation, unless a separate mapping-management workflow promotes the canonical record.
+
 ### 4.21 Execution Attempt
 
 One actual execution attempt of a selected Test Run ATC/dataset.
@@ -412,7 +470,7 @@ Fields:
 - `test_run_dataset_id`
 - `attempt_number`
 - `status`
-- `started_at`
+- `started_at` (nullable — see note below)
 - `completed_at`
 - `executed_by`
 - `execution_mode`
@@ -425,11 +483,14 @@ Fields:
 - `PASS`
 - `FAIL`
 - `BLOCKED`
+- `STOPPED`
 - `INTERRUPTED`
 
-Each retry creates a new attempt.
+Each retry creates a new attempt (`attempt_number` increments).
 
-**Interruption rule:** if a Test Run transitions to `INTERRUPTED` or `STOPPED` (Sec 9) while an attempt is `EXECUTING`, that attempt's `status` is set to `INTERRUPTED` (not silently left as `EXECUTING` and not auto-converted to `FAIL`). An `INTERRUPTED` attempt requires an explicit resume/re-run/new-run decision, per SRS FR-065.
+**`started_at` is nullable** to support the pre-execution `BLOCKED` case (State Machine I-03): an Attempt whose mapping is `UNRESOLVED`, or whose `CANDIDATE` mapping is rejected, becomes `BLOCKED` directly from `NOT_EXECUTED` without ever entering `EXECUTING`. This is the *only* case where a terminal Attempt has `started_at = NULL` — enforce via a check constraint: `started_at IS NOT NULL OR (status = 'BLOCKED' AND failure_category = 'MAPPING_EXCEPTION')`.
+
+**Interruption/Stop rule:** if a Test Run transitions to `STOPPED` while this Attempt is `EXECUTING`, the Attempt becomes `STOPPED`. If the Test Run transitions to `INTERRUPTED` while this Attempt is `EXECUTING`, the Attempt becomes `INTERRUPTED`. A Test Run reaching `INTERRUPTED` from `PAUSED` never marks any Attempt `INTERRUPTED`, since by definition no Attempt is `EXECUTING` while paused (State Machine I-12).
 
 ### 4.22 Step Result
 
@@ -456,6 +517,8 @@ Result states:
 - `FAIL`
 - `BLOCKED`
 - `NOT_EXECUTED`
+- `STOPPED`
+- `INTERRUPTED`
 
 ### 4.23 Failure / Exception
 
@@ -473,7 +536,7 @@ Fields:
 - `resolved`
 - `resolution_notes`
 
-**Constraint:** exactly one of `attempt_id` / `step_result_id` must be set — `attempt_id` for attempt-level failures (e.g., communication loss before any step ran), `step_result_id` for step-level failures. Enforced with a database check constraint, not left as an implicit "or".
+**Constraint:** exactly one of `attempt_id` / `step_result_id` must be set — `attempt_id` for attempt-level failures (e.g., a pre-execution mapping exception, or communication loss before any step ran), `step_result_id` for step-level failures. Enforced with a database check constraint, not left as an implicit "or".
 
 Categories:
 
@@ -562,10 +625,12 @@ test_configurations
 test_configuration_modules
 
 test_runs
+test_run_validations
 test_run_configuration_snapshots
 test_run_module_snapshots
 test_run_atcs
 test_run_datasets
+test_run_mapping_resolutions
 
 execution_attempts
 step_results
@@ -625,8 +690,15 @@ Step Results
 Evidence / Failure
 ```
 
+### Run lineage
+
+```
+Test Run  ──(parent_test_run_id)──▶  Test Run
+(recovery / re-execution)             (original)
+```
+
 This makes it possible to answer:
-> Which application version, module versions, ATC revision, dataset, mapping and execution attempt produced this result?
+> Which application version, module versions, ATC revision, dataset, mapping resolution and execution attempt produced this result — and, if this run followed an interrupted one, which run was that?
 
 ## 7. Historical Integrity Rules
 
@@ -665,60 +737,85 @@ Both attempts remain stored.
 
 Evidence files should be content-hashed. Replacing a file at the same logical evidence location is not permitted.
 
-### Rule 6 — Interruption is preserved, not overwritten
+### Rule 6 — Interruption/Stop is preserved, not overwritten
 
-An attempt interrupted mid-execution is marked `INTERRUPTED`, never silently marked `PASS`, `FAIL`, or left ambiguous as `EXECUTING`.
+An attempt stopped or interrupted mid-execution is marked `STOPPED`/`INTERRUPTED` respectively, never silently marked `PASS`, `FAIL`, or left ambiguous as `EXECUTING`.
 
-## 8. Result State Model
+### Rule 7 — Outcome is computed once
+
+A Test Run's `outcome` is set exactly once, when `status` reaches a terminal value, and never recalculated — even if later analysis might compute a different value from the same data (Test Run Outcome, Sec 8a).
+
+### Rule 8 — In-run mapping confirmations do not mutate canonical records
+
+Confirming a `CANDIDATE` mapping during a Test Run is recorded in `test_run_mapping_resolutions` only; it never updates `mapping_revisions.confidence_state` directly.
+
+## 8. Result State Model (Step Result / Execution Attempt)
 
 ```
-              ┌───────────────┐
-              │ NOT_EXECUTED  │
-              └───────┬───────┘
-                      │ execute
-                      ▼
-               ┌────────────┐
-               │ EXECUTING  │
-               └──────┬─────┘
-           ┌───────────┼────────────┐
-           │            │            │
-           ▼            ▼            ▼
-        PASS          FAIL       BLOCKED
-                                     │
-                          (mapping / communication /
-                           configuration / automation /
-                           environment conditions)
+NOT_EXECUTED
+     │
+     ├──(mapping resolved: STRONG / MANUAL_CONFIRMED / CANDIDATE-confirmed)──▶ EXECUTING
+     │
+     └──(mapping UNRESOLVED, or CANDIDATE rejected)──▶ BLOCKED
+                                                         (started_at = NULL)
 
-      EXECUTING ──(run interrupted)──▶ INTERRUPTED
+EXECUTING
+     ├──▶ PASS
+     ├──▶ FAIL       (category = TEST_FAILURE)
+     ├──▶ BLOCKED    (category = AUTOMATION_FAILURE / MAPPING_EXCEPTION /
+     │                COMMUNICATION_FAILURE / CONFIGURATION_FAILURE /
+     │                ENVIRONMENT_FAILURE)
+     ├──▶ STOPPED    (parent Test Run deliberately stopped mid-Attempt)
+     └──▶ INTERRUPTED (parent Test Run unexpectedly interrupted mid-Attempt)
 ```
 
-`BLOCKED` is a distinct outcome from `FAIL`, used when valid verification could not be performed because of mapping, communication, configuration, automation or environment conditions — it is **not** a sub-case of `FAIL`.
+`BLOCKED` is a distinct outcome from `FAIL`, used when valid verification could not be performed — either before execution began (unresolved mapping) or during it (mapping/communication/configuration/automation/environment conditions) — never for a verified product mismatch.
 
-`NOT_EXECUTED` is used for selected tests that were skipped/stopped before execution began.
+`NOT_EXECUTED` is terminal once its parent Attempt/Test Run reaches a terminal state — a selected item that was never reached.
 
-`INTERRUPTED` is used when a step or attempt was actively executing when its Test Run was interrupted or stopped; it requires an explicit resume/re-run decision (see 4.21).
+`STOPPED` (deliberate) and `INTERRUPTED` (unexpected) are always kept distinct, at both the Attempt and Step Result level, per State Machine v0.3+.
+
+**Attempt aggregation from Step Results** (State Machine I-10): if the Attempt entered `EXECUTING`, its terminal state is derived from its steps in priority order `INTERRUPTED` > `STOPPED` > `FAIL` > `BLOCKED` > `PASS`. If it never entered `EXECUTING`, its only valid terminal state is the pre-execution `BLOCKED` above — an Attempt with zero executed steps can never be `PASS`.
+
+## 8a. Test Run Outcome (separate from status)
+
+`Test Run.outcome` is computed once, per this algorithm (State Machine Sec 4):
+
+```
+1. If any Attempt = FAIL                                    → FAIL
+2. Else if any Attempt = BLOCKED                             → BLOCKED
+3. Else if status ∈ {STOPPED, INTERRUPTED} and any Attempt
+   is NOT_EXECUTED, STOPPED, or INTERRUPTED                  → PARTIAL
+4. Else if every selected Attempt = PASS                     → PASS
+5. Otherwise (no Attempt ever executed)                      → NOT_EVALUATED
+```
+
+`status` (lifecycle) and `outcome` (result) are never conflated. A `COMPLETED` run can have `outcome = FAIL`; a `STOPPED` run can too.
 
 ## 9. Test Run State Model
 
-Proposed states:
-
 ```
 DRAFT
-  ↓
-READY_FOR_VALIDATION
-  ↓
-VALIDATION_FAILED ←──────────────┐
-  ↓                              │
-READY                            │ fix/reconfigure
-  ↓                              │
-RUNNING ──→ PAUSED ──→ RUNNING   │
-  │                               │
-  ├──→ COMPLETED                  │
-  ├──→ STOPPED                    │
-  └──→ INTERRUPTED ───────────────┘
+  │ validate
+  ▼
+READY_FOR_VALIDATION ──fail──▶ VALIDATION_FAILED ──fix, revalidate──┐
+  │ pass                                                            │
+  ▼                                                                 │
+READY ◀──(edit invalidates)── (loop back to DRAFT) ─────────────────┘
+  │ start (freezes snapshot)
+  ▼
+RUNNING ──pause──▶ PAUSED ──resume──▶ RUNNING
+  │
+  ├──▶ COMPLETED     (every selected Attempt reached PASS/FAIL/BLOCKED)
+  ├──▶ STOPPED       (deliberate stop, or ≥1 Attempt left NOT_EXECUTED)
+  └──▶ INTERRUPTED   (unexpected failure — terminal, recovery creates
+                       a NEW Test Run via parent_test_run_id, never
+                       transitions this record back to READY)
 ```
 
-An interrupted run is not silently converted into a completed result. The system must preserve the interruption and allow an explicit resume/new run/re-run decision. Per Sec 4.21/8, any attempt that was `EXECUTING` when the Test Run entered `STOPPED`/`INTERRUPTED` is itself marked `INTERRUPTED`.
+`Test Run Validation` records (4.16a) capture every validation cycle, not just the latest — validation is repeatable, and a `READY` run reverts to `DRAFT` if its configuration is edited (staleness rule), marking the prior validation cycle `superseded` rather than deleting it.
+
+An interrupted run is never silently converted into a completed result, mutated, or transitioned back to `READY`. Recovery always creates a new Test Run linked via `parent_test_run_id`.
 
 ## 10. Dataset Model
 
@@ -742,7 +839,7 @@ Dataset-03
  password = ****
 ```
 
-Each selected dataset gets its own execution result and can be re-run independently. An ATC with no datasets defined (e.g., a simple non-parameterized check) executes through a single default `Test Run Dataset` placeholder row (Sec 4.20) rather than requiring a separate execution path.
+Each selected dataset gets its own execution result and can be re-run independently. An ATC with no datasets defined executes through a single default `Test Run Dataset` placeholder row (Sec 4.20) rather than requiring a separate execution path.
 
 ## 11. Mapping and Future TCS Corrections
 
@@ -761,13 +858,9 @@ Mapping revision (optionally tagged with the app version it was validated agains
 Adapter-specific target locator
 ```
 
-Therefore, a future correction to an ATC does not require manually editing every historical execution record.
-
-A mapping correction creates a new mapping revision. Future runs use the new revision; old runs retain the mapping revision that was actually used.
+A mapping correction (a genuinely new revision, via a mapping-management workflow) creates a new mapping revision. Future runs use the new revision; old runs retain the mapping revision that was actually used. This is distinct from an in-run `CANDIDATE` confirmation (Sec 4.20a), which never touches the canonical mapping.
 
 ## 12. Version Tracking Example
-
-For the representative case:
 
 ```
 Project: SM1 Verification
@@ -808,6 +901,10 @@ Results:
   ATC-001 → PASS
   ATC-004 → FAIL
   ATC-009 → BLOCKED
+
+Test Run:
+  status = COMPLETED
+  outcome = FAIL   (FAIL takes precedence over BLOCKED)
 ```
 
 If Card-2 is later upgraded to `3.05`, Round-05 remains associated with `3.04`.
@@ -829,7 +926,9 @@ applications + versions
 modules + versions
 test configurations
 test run snapshots
-test runs + attempts
+test runs + attempts (including parent_test_run_id lineage)
+test run validations
+test run mapping resolutions
 results + failures
 evidence
 audit events
@@ -859,7 +958,8 @@ Indexes should be considered for:
 
 - `project_id` on all project-owned tables.
 - TCS/ATC revision lineage.
-- `test_run_id` on execution-related tables.
+- `test_run_id` on execution-related tables, including `test_run_validations` and `test_run_mapping_resolutions`.
+- `parent_test_run_id` on `test_runs` (run lineage lookups).
 - `attempt_id` on step results/evidence/failures.
 - Version lookup by application/module.
 - Mapping lookup by logical object key + adapter type.
@@ -876,11 +976,13 @@ V1 should prefer:
 - Retire versions rather than delete versions referenced by history.
 - Preserve completed Test Runs and attempts.
 
-Physical deletion should be restricted to controlled maintenance operations and must not break historical references.
+Physical deletion should be restricted to controlled maintenance operations and must not break historical references, including `parent_test_run_id` chains.
 
 ## 16. Concurrency
 
-V1 is single-user/single-PC. The database is therefore not designed for simultaneous active Test Runs by multiple users.
+V1 is single-user/single-PC. Within one Test Run, at most one Execution Attempt is `EXECUTING` at any moment (State Machine I-07); the database is not designed for simultaneous active Test Runs by multiple users (State Machine I-08).
+
+State transitions at every level must be implemented as atomic, current-state-checked writes (compare-and-swap), because the UI thread and the execution/adapter thread are independent writers to the same records even in single-user V1 (State Machine Sec 12). A rejected transition must never attempt a compensating overwrite of the state that won the race.
 
 The schema nevertheless avoids assumptions that would prevent future multi-user deployment:
 
@@ -907,6 +1009,9 @@ These are intentionally deferred to detailed design:
 9. Retention/cleanup implementation.
 10. Database migration/versioning mechanism.
 11. Whether credential-like Dataset parameter values (Sec 4.6) should be masked or encrypted at rest and in exported reports.
+12. Exact blocking vs. non-blocking pre-execution validation rule set (State Machine Sec 7 gives categories only).
+13. Timeout threshold values (State Machine Sec 9 gives the branching rule only).
+14. Whether a mapping-management workflow (outside a Test Run) to promote a canonical mapping to `MANUAL_CONFIRMED` is needed for V1 or deferred.
 
 ## 18. Acceptance Questions for Review
 
@@ -917,7 +1022,7 @@ Before this schema is baselined, reviewers should verify:
 3. Can we identify the exact application version?
 4. Can we identify every module (hardware/firmware/software) and submodule version used?
 5. Can we identify the mapping revision used, and which application version it was validated against?
-6. Can we distinguish application FAIL from infrastructure BLOCKED, and from an INTERRUPTED attempt?
+6. Can we distinguish application FAIL from infrastructure BLOCKED, a deliberately STOPPED attempt, and an unexpectedly INTERRUPTED one?
 7. Can an ATC be re-run without overwriting the previous attempt?
 8. Can one dataset be re-run without changing another dataset's result?
 9. Can a corrected TCS/ATC/mapping be introduced without modifying historical runs?
@@ -925,8 +1030,11 @@ Before this schema is baselined, reviewers should verify:
 11. Can a reviewer understand a run from its exported report and evidence?
 12. Can the model evolve to centralized multi-user operation later?
 13. Can an ATC with zero datasets still be executed and traced with the same rigor as a parameterized one?
+14. Can a recovery/re-execution run always be traced back to the run it followed?
+15. Is it structurally impossible for an in-run mapping confirmation to silently change a canonical mapping used by other runs?
+16. Does the schema enforce (via constraints, not just convention) that an Attempt with zero executed steps can never be `PASS`?
 
 ---
 
-**Status:** Domain Model & Database Schema Draft v0.2 — ready for review.
-**Next artifact after review:** Detailed SQL schema + Test Run state machine + Adapter interface contract.
+**Status:** Domain Model & Database Schema Draft v0.3 — ready for review, incorporating State Machine v0.4.
+**Next artifact after review:** Detailed SQL schema (DDL), then Adapter interface contract.

@@ -1,10 +1,16 @@
 # TCS Automation — Domain Model & Database Schema
 
-**Version:** 0.3 — Design Draft
+**Version:** 0.3 — Baseline Candidate for SQL DDL
 **Status:** Working Draft
 **Baseline:** Architecture v0.2 / SRS v1.2 / Test Run State Machine v0.4
 
-> **Note on versioning:** this file combines two rounds of changes in one commit. The previously committed file on GitHub was still v0.1 — the intended v0.2 update did not land. This version (0.3) includes both the v0.2 fixes and the new v0.3 additions driven by the State Machine v0.4 baseline, so the repo goes straight from v0.1 to v0.3 in one step.
+> **Note on versioning:** this file combines three rounds of changes in one commit, kept at v0.3 throughout rather than bumped each time, per the explicit decision to avoid unnecessary version churn now that the State Machine is frozen. The previously committed file on GitHub was still v0.1 — the intended v0.2 update did not land. v0.3 includes: (a) the original v0.2 fixes, (b) the additions driven by State Machine v0.4 (`parent_test_run_id`, `outcome`, validation history, run-scoped mapping resolution), and (c) two DDL-readiness fixes from a subsequent review — the dataset snapshot and the step-level mapping-used link — plus two small provenance/clarity additions. The repo goes straight from v0.1 to this v0.3 in one commit.
+
+**DDL-readiness fixes (round 3, kept within v0.3):**
+- **Dataset snapshot was described but not modeled.** `Test Run Dataset` (Sec 4.20) now has `dataset_snapshot` and `dataset_snapshot_hash` fields, populated at Test Run preparation time, so a later edit to the source `Dataset` can never alter historical execution meaning — matching the same guarantee `Test Run Configuration Snapshot` already gave the environment.
+- **Mapping revision actually used was not explicitly traceable.** Added `mapping_revision_id` and `resolved_confidence` to `Step Result` (Sec 4.22), not `Execution Attempt` — because one Attempt can involve steps against multiple distinct mapped objects, an Attempt-level field would have been ambiguous. This directly answers acceptance question #5 at the level of an individual verification.
+- Added `source_application_version_id` / `source_target_id` provenance links to `Test Run Configuration Snapshot` (Sec 4.17), alongside the existing `source_test_configuration_id`, with an explicit note that provenance links are for navigation only — the frozen snapshot values remain the source of truth.
+- Added an explicit immutability statement for `ATC Revision` (Sec 4.5): confirms no separate ATC content snapshot is needed, since the revision itself never changes after creation.
 
 **Changes since v0.1 (the "v0.2" fixes that should have landed earlier):**
 - Split `Hardware Module` into a generic `Module` entity with an explicit `module_type` (`HARDWARE` / `FIRMWARE` / `SOFTWARE`) so software/firmware-only components have a proper home (previously `Module Version` claimed hardware/software/firmware coverage while its parent entity was scoped to hardware only).
@@ -182,6 +188,8 @@ Key fields:
 - `status`
 - `created_by`
 - `created_at`
+
+**Immutability:** an ATC Revision, once created, is immutable — its `title`, `objective`, `preconditions`, `expected_result`, and step definitions never change after creation. A correction always creates a new `atc_revision_id` (Design Principle 5, Sec 2). This is the guarantee that lets `Test Run ATC` (Sec 4.19) reference `atc_revision_id` directly as sufficient historical proof of exactly what was tested, without needing a separate ATC content snapshot.
 
 ### 4.6 Dataset
 
@@ -392,6 +400,8 @@ Key fields:
 - `snapshot_id`
 - `test_run_id`
 - `source_test_configuration_id`
+- `source_application_version_id` (provenance link, in addition to the frozen `application_name`/`application_version` text below)
+- `source_target_id` (provenance link, in addition to `target_snapshot`)
 - `application_name`
 - `application_version`
 - `target_snapshot`
@@ -400,7 +410,7 @@ Key fields:
 - `environment_snapshot`
 - `created_at`
 
-The snapshot must be self-contained enough to identify the environment used even if reusable version records later change.
+The snapshot must be self-contained enough to identify the environment used even if reusable version records later change — the frozen text/value fields (`application_name`, `application_version`, `target_snapshot`) are the source of truth for what the run actually used. The `source_*_id` fields are provenance links back to the reusable records, useful for reporting and navigation, but must never be re-read at display time as if they reflected the *current* state of that record — only the frozen values do.
 
 ### 4.18 Test Run Module Snapshot
 
@@ -438,10 +448,12 @@ Fields:
 - `is_default_placeholder` (boolean)
 - `sequence_no`
 - `selection_status`
+- `dataset_snapshot` (the dataset's `parameters` content, copied at Test Run preparation time; `NULL` when `is_default_placeholder = true`)
+- `dataset_snapshot_hash` (content hash of `dataset_snapshot`, for integrity verification on backup/restore)
 
 **Zero-dataset ATCs:** if an ATC Revision defines no datasets, Test Run preparation creates exactly one `Test Run Dataset` row with `dataset_id = NULL` and `is_default_placeholder = true`. This guarantees every `Execution Attempt` always resolves through a `Test Run Dataset`, without requiring a second, optional FK path on `Execution Attempt`.
 
-The selected dataset definition should be snapshotted or content-hashed so later dataset edits cannot alter historical meaning.
+**Dataset snapshot rule:** `dataset_snapshot` is populated by copying the source `Dataset.parameters` content at the moment the Test Run is prepared (the same `READY → RUNNING` freeze point as the configuration snapshot, Sec 4.17). A later edit to the source `Dataset` — a new revision, a corrected parameter value — never alters `dataset_snapshot` on an already-`RUNNING`-or-later Test Run. Reports and history always read from `dataset_snapshot`, never by joining live to `Dataset.parameters`. `dataset_id` remains on the row purely as a provenance link back to the source dataset, the same non-authoritative role `source_test_configuration_id` plays in Sec 4.17.
 
 ### 4.20a Test Run Mapping Resolution
 
@@ -503,6 +515,8 @@ Fields:
 - `step_sequence`
 - `action_type`
 - `target_reference`
+- `mapping_revision_id` (nullable — the specific `Mapping Revision` actually used to resolve `target_reference` for this step, if the step involved object identification)
+- `resolved_confidence` (nullable — `STRONG` | `MANUAL_CONFIRMED`, snapshotted from the mapping/resolution at the moment this step executed)
 - `expected_result`
 - `actual_result`
 - `result_state`
@@ -510,6 +524,8 @@ Fields:
 - `completed_at`
 - `error_code`
 - `error_message`
+
+**Why at Step Result, not Execution Attempt:** an ATC (and therefore one Attempt) can involve steps against multiple distinct logical objects, each potentially resolved by a different `Mapping Revision` with a different confidence state. Recording `mapping_revision_id` on `Execution Attempt` would be ambiguous the moment an ATC touches more than one mapped object. Recording it per `Step Result` answers acceptance question #5 ("which mapping revision was actually used") unambiguously for every individual verification, not just at the whole-Attempt level. `mapping_revision_id` is `NULL` for steps that don't involve object identification (e.g., a pure wait/delay step).
 
 Result states:
 
@@ -1021,7 +1037,7 @@ Before this schema is baselined, reviewers should verify:
 2. Can we identify the exact ATC revision and dataset (or default placeholder) used?
 3. Can we identify the exact application version?
 4. Can we identify every module (hardware/firmware/software) and submodule version used?
-5. Can we identify the mapping revision used, and which application version it was validated against?
+5. Can we identify the exact mapping revision used for each individual verification step (not just at the whole-Attempt level), and which application version that revision was validated against?
 6. Can we distinguish application FAIL from infrastructure BLOCKED, a deliberately STOPPED attempt, and an unexpectedly INTERRUPTED one?
 7. Can an ATC be re-run without overwriting the previous attempt?
 8. Can one dataset be re-run without changing another dataset's result?
@@ -1036,5 +1052,5 @@ Before this schema is baselined, reviewers should verify:
 
 ---
 
-**Status:** Domain Model & Database Schema Draft v0.3 — ready for review, incorporating State Machine v0.4.
-**Next artifact after review:** Detailed SQL schema (DDL), then Adapter interface contract.
+**Status:** Domain Model & Database Schema v0.3 — Baseline for SQL DDL. Both mandatory DDL-readiness gaps (dataset snapshot, step-level mapping traceability) are resolved; remaining items are Sec 17 open decisions appropriate to resolve during DDL itself, not further domain-model review.
+**Next artifact:** Detailed SQL schema (DDL), then Adapter interface contract.

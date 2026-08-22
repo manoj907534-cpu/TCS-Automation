@@ -1,7 +1,7 @@
 # TCS Automation — Adapter Interface Contract
 
 **Version:** 0.1 — Design Draft
-**Status:** Working Draft
+**Status:** Approved Baseline
 **Baseline:** Architecture v0.2 / Domain Model & Database Schema v0.3 / Test Run State Machine v0.4 / SQL Schema (DDL) v0.1
 
 ## 1. Purpose and Scope

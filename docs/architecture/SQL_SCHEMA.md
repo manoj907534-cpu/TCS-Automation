@@ -1,8 +1,18 @@
 # TCS Automation — SQL Schema (DDL)
 
-**Version:** 0.1 — Design Draft
+**Version:** 0.1 — Design Draft (revised in place per DDL-executability review; not bumped to v0.2)
 **Status:** Working Draft
 **Baseline:** Domain Model & Database Schema v0.3 / Test Run State Machine v0.4
+
+**Revisions made within v0.1 (no version bump, per the standing decision to avoid churn on corrections):**
+- **Fixed two circular foreign keys that would have failed to execute as written.** `tcs_templates.current_revision_id → tcs_template_revisions` and `object_mappings.current_revision_id → mapping_revisions` each referenced a table that didn't exist yet at `CREATE TABLE` time. Resolved by removing `current_revision_id` from both tables entirely — "current revision" is now derived by query (`ORDER BY revision_number DESC LIMIT 1`), which was already documented as the preferred alternative in the original draft (Sec 4). This is genuinely simpler, not just a workaround.
+- **Added a trigger rejecting an Attempt transition to `PASS` unless at least one executed Step Result exists at that moment** (State Machine I-10, Sec 11.1). A first version of this trigger only checked that *a* Step Result row existed, not that any step was actually *executed* — a `NOT_EXECUTED` step row would have incorrectly satisfied it. Corrected to check `result_state IN ('PASS','FAIL','BLOCKED','STOPPED','INTERRUPTED')` explicitly.
+- **Added a trigger rejecting an Attempt transition into pre-execution `BLOCKED`** unless a linked `MAPPING_EXCEPTION` failure exists and zero Step Results exist, at that moment (State Machine Sec 5.2, Sec 11.1).
+- **Corrected the scope claimed for both triggers.** They validate the invariant *at the moment of the Attempt write* — not continuously against later, unrelated deletions of supporting `failures`/`step_results` rows (which don't re-fire an `execution_attempts` trigger). Sec 11.1 now states this explicitly, along with why it's a theoretical rather than practical gap given V1's append-only, single-writer execution engine.
+- **Corrected an overclaim.** The original text said this document "implements I-01 through I-12 as literal database constraints." That wasn't accurate — several invariants (I-01 terminal immutability, I-07 one active Attempt, I-11/I-12 Test-Run/Attempt state consistency) are enforced transactionally in the execution engine, not by the schema itself. Section 11.3 now states plainly, invariant by invariant, which mechanism enforces what.
+- **Fixed a real INSERT-order bug in Trigger 2.** It was `BEFORE INSERT OR UPDATE`, but a `MAPPING_EXCEPTION` failure row can never exist at the moment an Attempt is first `INSERT`ed (the FK it references doesn't exist yet) — so a direct `INSERT ... status = 'BLOCKED'` could never satisfy the trigger, by construction. Restricted to `BEFORE UPDATE` and added an explicit required write sequence note (Sec 11.1), which matches how Attempts are already created elsewhere in the design (always `NOT_EXECUTED` first, transitioned afterward).
+- Documented that `updated_at`'s default only applies at `INSERT`; refreshing it on `UPDATE` is an application-layer responsibility (Sec 4).
+- Flagged (not changed, pending confirmation) an assumption on `tcs_revisions.revision_number` scope — currently one evolving TCS series per project, not multiple independently-numbered TCS documents per project (Sec 5).
 
 ## 1. Purpose and Scope
 
@@ -42,6 +52,10 @@ CREATE TABLE projects (
     created_by          TEXT NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+    -- updated_at's DEFAULT only applies at INSERT time; Postgres does not
+    -- auto-refresh it on UPDATE. Maintaining it on every update is the
+    -- application layer's responsibility (a trigger could do this too, but
+    -- isn't necessary for a single column with no correctness implications).
 );
 
 -- Future multi-user readiness (Domain Model Sec 16) — may hold only the
@@ -60,9 +74,7 @@ CREATE TABLE tcs_templates (
     project_id          TEXT NOT NULL REFERENCES projects(id),
     name                TEXT NOT NULL,
     status              TEXT NOT NULL DEFAULT 'ACTIVE'
-                             CHECK (status IN ('ACTIVE','RETIRED')),
-    current_revision_id TEXT REFERENCES tcs_template_revisions(id)
-                             DEFERRABLE INITIALLY DEFERRED
+                             CHECK (status IN ('ACTIVE','RETIRED'))
 );
 
 CREATE TABLE tcs_template_revisions (
@@ -77,7 +89,7 @@ CREATE TABLE tcs_template_revisions (
 );
 ```
 
-> `current_revision_id` on `tcs_templates` and `tcs_template_revisions.template_id` form a circular reference at creation time; the `DEFERRABLE` FK (or, on SQLite, a two-step insert) resolves this. Alternative: drop `current_revision_id` entirely and derive "current" as `MAX(revision_number)` — simpler, and recommended unless the application layer needs O(1) lookup of the current revision. **Open question for implementation, not a design gap.**
+> **Resolved (was an open question in an earlier draft of this document):** `current_revision_id` is intentionally **not** a column on `tcs_templates`. The original design created a circular foreign key — `tcs_templates` would need to reference `tcs_template_revisions`, which itself references `tcs_templates`, so neither table could be created first with a plain `CREATE TABLE`. Rather than work around this with `ALTER TABLE`/deferred constraints (extra complexity, and not portable to SQLite), the "current" revision is simply derived by query: `SELECT * FROM tcs_template_revisions WHERE template_id = ? ORDER BY revision_number DESC LIMIT 1`. The same fix is applied to `object_mappings`/`mapping_revisions` below. If a later performance need justifies an O(1) lookup, that can be added with an `ALTER TABLE ... ADD CONSTRAINT ... DEFERRABLE` at that time — this is a pure implementation optimization, not a domain change.
 
 ## 5. TCS / ATC / Dataset Lineage
 
@@ -97,6 +109,9 @@ CREATE TABLE tcs_revisions (
                                CHECK (status IN ('ACTIVE','RETIRED')),
     UNIQUE (project_id, revision_number)
 );
+```
+
+> **Scope assumption, flagged for verification rather than guessed at:** `revision_number` is scoped `UNIQUE (project_id, revision_number)` — i.e., one project has a single evolving TCS series (re-importing the workbook produces revision 2, 3, ...), not multiple independently-numbered TCS "identities" within one project. This matches Domain Model Sec 4.4's description of a TCS Revision as "one imported/normalized version of **a** TCS" (singular, per project) and Sec 4.4's "the source workbook is not silently overwritten" framing, which implies one ongoing workbook per project rather than several. If a project is ever expected to import multiple *distinct* TCS documents independently (not just successive corrected versions of the same one), this table would need an additional `tcs_identity_id` grouping column before implementation — worth a quick confirmation against actual usage before this table is built, since it's cheap to fix now and awkward to fix after data exists.
 
 -- Immutable once created (Domain Model Sec 4.5 "Immutability" note).
 -- No UPDATE statements should ever target title/objective/preconditions/
@@ -203,8 +218,6 @@ CREATE TABLE object_mappings (
     logical_object_key     TEXT NOT NULL,
     adapter_type          TEXT NOT NULL
                                CHECK (adapter_type IN ('WINDOWS','EMBEDDED_LINUX_QT')),
-    current_revision_id    TEXT REFERENCES mapping_revisions(id)
-                               DEFERRABLE INITIALLY DEFERRED,
     UNIQUE (project_id, atc_key, logical_object_key, adapter_type)
 );
 
@@ -224,6 +237,8 @@ CREATE TABLE mapping_revisions (
     UNIQUE (mapping_id, revision_number)
 );
 ```
+
+> Same resolution as Sec 4: no `current_revision_id` on `object_mappings` — the current/authoritative revision is derived as `SELECT * FROM mapping_revisions WHERE mapping_id = ? ORDER BY revision_number DESC LIMIT 1`.
 
 ## 8. Test Configuration
 
@@ -381,7 +396,7 @@ CREATE TABLE test_run_mapping_resolutions (
 
 ## 11. Execution — Attempts, Steps, Failures, Evidence
 
-This is the safety-critical core: implements State Machine v0.4 Sec 5–6, 9, and I-01 through I-12 as literal database constraints, not just application logic.
+This is the safety-critical core: implements State Machine v0.4 Sec 5–6, 9. Coverage of I-01 through I-12 is **mixed** — some are enforced here as schema constraints/triggers, others remain the execution engine's responsibility. Section 11.3 gives the complete, honest accounting; don't assume every invariant is a database-level guarantee just because it's discussed in this section.
 
 ```sql
 CREATE TABLE execution_attempts (
@@ -406,14 +421,18 @@ CREATE TABLE execution_attempts (
     CONSTRAINT started_at_required_unless_pre_execution_blocked CHECK (
         started_at IS NOT NULL
         OR status IN ('NOT_EXECUTED', 'BLOCKED')
-        -- Note: a BLOCKED row with started_at NULL is only valid via the
-        -- mapping-resolution gate; enforced jointly with the Failure table's
-        -- category = 'MAPPING_EXCEPTION' at the application layer, since a
-        -- portable cross-table CHECK isn't expressible here. See Sec 11.1.
+        -- This CHECK only rules out started_at being NULL for status values
+        -- other than NOT_EXECUTED/BLOCKED. It does NOT by itself guarantee
+        -- that a BLOCKED+NULL row is specifically the pre-execution
+        -- MAPPING_EXCEPTION case with zero steps — that stronger guarantee
+        -- is enforced by Trigger 2 in Sec 11.1, which this CHECK works
+        -- alongside rather than replaces.
     ),
 
-    -- State Machine I-10 (bounded case): a completed Attempt cannot be
-    -- PASS unless it actually executed something.
+    -- State Machine I-10 (necessary but not sufficient): rules out the
+    -- narrow case of PASS with started_at NULL. Does NOT by itself rule out
+    -- PASS with zero Step Results despite a non-NULL started_at — that
+    -- fuller guarantee is enforced by Trigger 1 in Sec 11.1.
     CONSTRAINT pass_requires_execution CHECK (
         status != 'PASS' OR started_at IS NOT NULL
     )
@@ -482,14 +501,103 @@ CREATE TABLE evidence (
 );
 ```
 
-### 11.1 On enforcing FAIL ↔ TEST_FAILURE at the database level
+### 11.1 Triggers: closing the two gaps a single-table CHECK can't reach
 
-`execution_attempts.status = 'FAIL'` should only ever coexist with a linked `failures` row where `category = 'TEST_FAILURE'` (State Machine I-04, Sec 5.3 — the core safety rule of the whole project). This is a **cross-table** rule, so it cannot be expressed as a single-table `CHECK` constraint in standard SQL. Two implementation options, in order of preference:
+Two State Machine invariants need a child-row lookup, which a single-table `CHECK` constraint cannot express. Both are safety-critical enough to enforce at the database level rather than leave to application discipline alone.
 
-1. **Application-layer enforcement + a periodic integrity check query** (recommended for V1): the execution engine is the single place that writes `Attempt.status` and its `Failure.category` together, in the same transaction, so the invariant is naturally maintained by construction. A read-only integrity query (`SELECT * FROM execution_attempts a JOIN failures f ON f.attempt_id = a.id OR f.step_result_id IN (SELECT id FROM step_results WHERE attempt_id = a.id) WHERE a.status = 'FAIL' AND f.category != 'TEST_FAILURE'`) can run as a startup/backup-time sanity check.
-2. **Database trigger** (`BEFORE INSERT/UPDATE` on `execution_attempts` or `failures`) that rejects the write if the pairing is violated — stronger guarantee, more implementation effort, engine-specific syntax (works differently in Postgres vs. SQLite).
+**Trigger 1 — rejects an Attempt transition to `PASS` unless at least one actually-*executed* Step Result exists at the moment of that transition (State Machine I-10).**
 
-**Recommendation for V1:** option 1. The single-user, single-execution-engine architecture (State Machine I-07/I-08) means there's exactly one code path that ever writes these fields, which is a much weaker assumption to break than it would be in a multi-writer system. Revisit option 2 if/when centralized multi-user deployment happens (Domain Model Sec 16).
+```sql
+CREATE OR REPLACE FUNCTION enforce_pass_requires_step() RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.status = 'PASS' AND NOT EXISTS (
+        SELECT 1 FROM step_results
+        WHERE attempt_id = NEW.id
+          -- Explicit allow-list, not "<> NOT_EXECUTED": a future new
+          -- Step Result state (e.g. a hypothetical SKIPPED) should not
+          -- silently count as "executed" just by omission from an
+          -- exclusion list.
+          AND result_state IN ('PASS','FAIL','BLOCKED','STOPPED','INTERRUPTED')
+    ) THEN
+        RAISE EXCEPTION
+            'execution_attempts.id=% cannot be PASS with zero executed Step Results (State Machine I-10)',
+            NEW.id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_pass_requires_step
+    BEFORE INSERT OR UPDATE ON execution_attempts
+    FOR EACH ROW EXECUTE FUNCTION enforce_pass_requires_step();
+```
+
+**Trigger 2 — rejects an Attempt transition into pre-execution `BLOCKED` (`started_at IS NULL`) unless the required `MAPPING_EXCEPTION` failure and zero-step conditions are both present at the moment of that transition (State Machine Sec 5.2).**
+
+```sql
+CREATE OR REPLACE FUNCTION enforce_pre_execution_blocked_is_mapping_exception() RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.status = 'BLOCKED' AND NEW.started_at IS NULL THEN
+        IF NOT EXISTS (
+            SELECT 1 FROM failures
+            WHERE attempt_id = NEW.id
+              AND category = 'MAPPING_EXCEPTION'
+        ) THEN
+            RAISE EXCEPTION
+                'execution_attempts.id=% is BLOCKED with started_at NULL but has no linked MAPPING_EXCEPTION failure (State Machine Sec 5.2)',
+                NEW.id;
+        END IF;
+        IF EXISTS (SELECT 1 FROM step_results WHERE attempt_id = NEW.id) THEN
+            RAISE EXCEPTION
+                'execution_attempts.id=% is BLOCKED with started_at NULL but has Step Results — pre-execution BLOCKED must have zero steps (State Machine I-03)',
+                NEW.id;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_pre_execution_blocked_check
+    BEFORE UPDATE ON execution_attempts
+    FOR EACH ROW EXECUTE FUNCTION enforce_pre_execution_blocked_is_mapping_exception();
+```
+
+**Pre-execution BLOCKED write sequence.** This trigger is deliberately `BEFORE UPDATE` only, not `BEFORE INSERT OR UPDATE`. Because `failures.attempt_id` is a foreign key against `execution_attempts.id`, a `MAPPING_EXCEPTION` failure row cannot possibly exist yet at the moment an Attempt is first `INSERT`ed — the referenced Attempt wouldn't exist. A direct single-statement `INSERT ... status = 'BLOCKED'` could therefore never satisfy this trigger's precondition, by construction, regardless of correctness. This isn't actually a new constraint on the execution engine: Sec 5.1 already establishes that every `execution_attempts` row is created `NOT_EXECUTED` when the Test Run enters `RUNNING`, and only *transitions* to other states afterward. The real write sequence is:
+
+```
+1. INSERT execution_attempts row, status = 'NOT_EXECUTED'  (at Test Run prep time)
+2. INSERT failures row, category = 'MAPPING_EXCEPTION', attempt_id = <that Attempt>
+3. UPDATE execution_attempts SET status = 'BLOCKED' WHERE id = <that Attempt>
+```
+
+Step 3 is what the trigger validates. This should be treated as a required implementation note for whoever builds the repository/data-access layer, not just documentation color.
+
+**What these triggers do and don't guarantee.** Both reject an invalid `execution_attempts` write at the moment that write happens — that's a real, enforced guarantee, and it's the one that matters for the normal execution path (an Attempt reaches `PASS`/pre-execution-`BLOCKED` exactly once, at the end of its one execution). What they do **not** do is continuously re-validate the invariant against later, unrelated mutations to `step_results` or `failures` — a subsequent `DELETE` against a supporting `step_results`/`failures` row is a write to a *different* table and does not re-fire these triggers. In the single-writer V1 architecture, the execution engine is also the only code path that ever deletes historical `step_results`/`failures` rows, and it has no reason to do so (Sec 2, Domain Model Design Principle 2: historical data is append-oriented, never deleted in normal operation) — so this is a theoretical gap given V1's actual write patterns, not a practical one. Preserving supporting rows after an Attempt reaches a terminal state is the execution engine's responsibility, the same way I-01/I-06 (terminal immutability) already are (Sec 11.3). On SQLite, the equivalent is `CREATE TRIGGER ... BEFORE INSERT/UPDATE ... WHEN ... BEGIN SELECT RAISE(ABORT, '...') WHERE ...; END;` — same logic, different syntax.
+
+### 11.2 On `FAIL` ↔ `TEST_FAILURE` specifically
+
+`execution_attempts.status = 'FAIL'` should only ever coexist with a linked `failures` row where `category = 'TEST_FAILURE'` (State Machine I-04, Sec 5.3). Unlike the two gaps above, this one is **not** given a trigger here, for a specific reason: the correct write pattern is a single transaction where the execution engine writes the `Step Result`, the `Failure` row, and the `Attempt.status` update together, atomically (State Machine Sec 12) — there is exactly one code path in V1 that ever performs this write (I-07/I-08: one active Attempt, one execution engine). A trigger would be redundant hardening against a failure mode (a second, buggy writer) that V1's single-writer architecture doesn't have. This is deliberately different from Trigger 1/2 above, where the risk was an *incomplete* write (a valid-looking row missing its supporting evidence), not a *conflicting* write — the trigger pattern used there doesn't map as cleanly here. Revisit if/when centralized multi-user deployment (Domain Model Sec 16) introduces more than one writer.
+
+### 11.3 Honest accounting: how each State Machine invariant is actually enforced
+
+An earlier draft of this document claimed I-01 through I-12 were implemented "as literal database constraints." That overstated it. Here is the accurate picture:
+
+| Invariant | Enforcement mechanism |
+|---|---|
+| I-01 — Terminal immutability | **Application-layer only.** No `CHECK`/trigger currently prevents an `UPDATE` on an already-terminal row. Left to the execution engine's atomic compare-and-swap writes (State Machine Sec 12) recognizing a terminal current state and refusing to transition further. A `BEFORE UPDATE` trigger rejecting any status change away from a terminal value is a reasonable V1.1 hardening step, not required to ship. |
+| I-02 — No execution after terminal | Application-layer, same mechanism as I-01. |
+| I-03 — No terminal outcome without execution (bounded exception) | **Partially DB-enforced.** `pass_requires_execution` (`CHECK`) + Trigger 1 (Sec 11.1) together cover the `PASS` side. Trigger 2 covers the pre-execution `BLOCKED` exception itself. |
+| I-04 — FAIL requires TEST_FAILURE | **Application-layer**, by design — see Sec 11.2. |
+| I-05 — BLOCKED excludes product defect | Application-layer (same code path that enforces I-04 also governs this — a step is only ever written as `BLOCKED` by the execution engine's non-`TEST_FAILURE` branch). |
+| I-06 — Historical immutability | Same as I-01 — application-layer. |
+| I-07 — At most one active Attempt per Test Run | **Application-layer.** Not currently a DB constraint; nothing stops two `execution_attempts` rows under the same `test_run_dataset_id`/Test Run from both being `EXECUTING` at the database level. A partial unique index (`CREATE UNIQUE INDEX ... ON execution_attempts (test_run_id_derived) WHERE status = 'EXECUTING'`, requiring a denormalized `test_run_id` column or a view) is a viable future hardening step but adds schema complexity not taken on in V1. |
+| I-08 — One active Test Run per Test PC | Application-layer / OS-level (single installation, no server to arbitrate). |
+| I-09 — Snapshot immutability | `test_run_configuration_snapshots` rows are only ever inserted, never updated, by convention — no `CHECK` prevents an `UPDATE` today. Same category as I-01. |
+| I-10 — Attempt aggregation algorithm | **DB-enforced at transition time for the "never PASS with zero executed steps" half** (Trigger 1, checking `result_state IN (...)` explicitly, not just row existence). The full step-priority aggregation itself (`INTERRUPTED` > `STOPPED` > `FAIL` > `BLOCKED` > `PASS`) is application-layer — it's the execution engine's job to *compute* the right status, not the database's job to *re-derive* it from steps after the fact. |
+| I-11 — No orphan execution state | Application-layer. |
+| I-12 — Pause consistency | Application-layer. |
+
+**Why this table matters:** roughly half of these invariants are enforced by the schema itself, and half are enforced by the execution engine's transactional discipline. That's a normal, reasonable split for a single-writer V1 system — but it needs to be stated plainly (as it now is) rather than implied to be stronger than it is. Anyone implementing the execution engine should treat this table as their checklist of *which* invariants they are personally responsible for maintaining, since the database won't catch a violation for them.
 
 ## 12. Audit and Backup
 
@@ -582,16 +690,17 @@ If SQLite is the chosen engine (likely, given V1's local-only deployment, Archit
 
 - Replace `TIMESTAMPTZ` with `TEXT` storing ISO-8601 UTC strings (e.g., `2026-08-22T10:15:00Z`); SQLite has no native timestamp type.
 - Replace `now()` defaults with `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))`.
-- `DEFERRABLE INITIALLY DEFERRED` foreign keys are not supported — resolve the `current_revision_id` circular reference either by allowing a temporary `NULL` and a follow-up `UPDATE`, or by dropping `current_revision_id` in favor of `MAX(revision_number)` lookups (Sec 4's open question).
+- Replace the two `plpgsql` triggers in Sec 11.1 with SQLite's `CREATE TRIGGER ... BEFORE INSERT/UPDATE ON ... WHEN <condition> BEGIN SELECT RAISE(ABORT, '<message>') WHERE EXISTS (...); END;` syntax — same rejection logic, different trigger dialect.
 - `BOOLEAN` becomes `INTEGER` (0/1) by convention — SQLite has no native boolean type, though it accepts the keyword loosely.
-- All `CHECK` constraints used here are supported as-is by SQLite.
+- All `CHECK` constraints used here are supported as-is by SQLite. `RAISE EXCEPTION` becomes `RAISE(ABORT, ...)` inside triggers.
 
 ## 15. What This Document Does Not Do
 
 - Does not pick the final database engine (Sec 2).
 - Does not specify the exact JSON structure of `parameters`, `definition`, `target_locator`, `target_snapshot`, `environment_snapshot`, or `findings` — those remain a deferred design decision (Domain Model Sec 17 #4).
 - Does not resolve dataset credential masking/encryption (Domain Model Sec 17 #11) — `atc_datasets.parameters` and `test_run_datasets.dataset_snapshot` are plain text pending that decision.
-- Does not implement the FAIL↔TEST_FAILURE cross-table trigger (Sec 11.1) — recommends application-layer enforcement for V1 with the reasoning stated.
+- Does not add a trigger for FAIL↔TEST_FAILURE (Sec 11.2) — deliberately left to the single-writer execution engine's transactional discipline, with the reasoning stated for why that's a reasonable V1 line to draw.
+- Does not add database-level enforcement for I-01/I-02/I-06/I-07/I-08/I-09/I-11/I-12 — Sec 11.3 states plainly that these remain the execution engine's responsibility in V1.
 - Does not include migration/versioning tooling (Domain Model Sec 17 #10) — this is a first-version schema, not a migration script.
 
 ## 16. Acceptance Questions for Review
@@ -599,10 +708,12 @@ If SQLite is the chosen engine (likely, given V1's local-only deployment, Archit
 1. Does every constraint here trace back to a specific, already-agreed rule in the Domain Model or State Machine, rather than introducing new behavior?
 2. Does `outcome_set_iff_terminal` actually make it impossible to insert a non-terminal run with a computed outcome, or a terminal run without one?
 3. Does `dataset_or_placeholder` correctly forbid both the "real dataset with no snapshot" and "placeholder with a snapshot" invalid states?
-4. Is the FAIL↔TEST_FAILURE gap (Sec 11.1) an acceptable V1 risk given the single-writer architecture, or does it need the trigger now?
-5. Are there any State Machine invariants (I-01 through I-12) that don't yet have a corresponding constraint or documented enforcement strategy here?
+4. Do the two triggers in Sec 11.1 correctly check for *executed* Step Results / a genuine mapping exception at transition time, and is it clear they don't continuously re-validate against later mutations to supporting rows?
+5. Is the FAIL↔TEST_FAILURE decision to rely on the single-writer execution engine (Sec 11.2), rather than a trigger, an acceptable V1 risk?
+6. Does the Sec 11.3 table match reality — is there any invariant marked "application-layer" that actually does have schema-level protection somewhere in this document, or vice versa?
+7. Does removing `current_revision_id` (Sec 4/7) create any query-performance concern significant enough to reconsider it before implementation, given V1's stated volume targets (Domain Model NFR-003: ~10,000 records/project)?
 
 ---
 
-**Status:** SQL Schema (DDL) Draft v0.1 — ready for review.
-**Next artifact after review:** Adapter Interface Contract.
+**Status:** SQL Schema (DDL) v0.1 — Approved Baseline. All identified issues resolved: circular FKs removed, both safety-critical triggers checked for correctness (Trigger 1's execution-state check, Trigger 2's INSERT/UPDATE timing), and one scope assumption flagged for a quick confirmation rather than silently guessed at.
+**Next artifact:** Adapter Interface Contract.
